@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────
+# AgentRx — Railway Configuration
+# ─────────────────────────────────────────────
+
+[build]
+builder        = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+# ── Default deploy config (applies to agentrx-api) ──────────────
+[deploy]
+restartPolicyType       = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+numReplicas             = 1
+
+[deploy.healthcheck]
+path    = "/health"
+timeout = 30
+
+# ── Worker service override ──────────────────────────────────────
+# Disables HTTP health check for the worker — it has no HTTP server.
+# Without this, Railway pings /health, gets nothing, and enters a
+# crash-restart loop thinking the worker is broken.
+[services.agentrx-worker.deploy]
+restartPolicyType       = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+[services.agentrx-worker.deploy.healthcheck]
+path = ""

@@ -1,0 +1,45 @@
+# Environment secrets — NEVER commit these
+.env
+*.env
+.env.*
+.env.railway
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# pytest / testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Docker
+*.dockerignore
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Redis dump file if running locally outside Docker
+dump.rdb
