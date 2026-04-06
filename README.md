@@ -35,8 +35,8 @@ Docs:     https://agentrx-production.up.railway.app/docs
 
 ## Get an API Key
 
-Contact: support@chainassetslab.com
+Contact: Chainassetslab@gmail.com
 
 ## Built By
 
-Chain Assets LLC — https://chainassetslab.com
+Chain Assets LLC
