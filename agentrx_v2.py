@@ -1,5 +1,23 @@
 """
-AgentRx: Metacognitive Recovery API — v2.4 (Production Hardening)
+AgentRx: Metacognitive Recovery API — v2.5 (OpenClaw Integration)
+=================================================================
+Changes in v2.5:
+
+  OPENCLAW 1 — CORS Middleware
+  OPENCLAW 2 — Optional latency_ms (default=0)
+  OPENCLAW 3 — _diagnose_internal() extracted
+  OPENCLAW 4 — /v1/openclaw/recover endpoint
+  OPENCLAW 5 — openclaw_instruction field on RecoveryAction
+
+Previous patches (v2.4):
+  FIX 11 — Sequential Webhook Bottleneck
+  FIX 12 — IP-Based Rate Limiting (Serverless Trap)
+  FIX 13 — Schema Cache Poisoning / OOM Vector
+
+Run API:
+    uvicorn agentrx_v2:app --host 0.0.0.0 --port 8000 --workers 2
+Run webhook worker:
+    python webhook_worker.py
 """
 
 import hashlib
@@ -15,6 +33,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field, model_validator
@@ -82,6 +101,7 @@ async def lifespan(app: FastAPI):
     logger.info("Redis connection pool closed.")
 
 def rate_limit_key_func(request: Request) -> str:
+    """FIX 12: Rate limit by tenant_id not IP (serverless-safe)."""
     tenant = getattr(request.state, "tenant", None)
     if tenant and tenant.get("tenant_id"):
         return f"tenant:{tenant['tenant_id']}"
@@ -92,11 +112,12 @@ limiter = Limiter(key_func=rate_limit_key_func)
 
 app = FastAPI(
     title="AgentRx: Metacognitive Recovery API",
-    version="2.4.0",
+    version="2.5.0",
     description=(
         "Stateful failure diagnosis and recovery for AI agents. "
         "Classifies MCP tool failures, injects corrections, detects loops, "
-        "and scores preflight risk — keyed per agent_id with Redis state."
+        "and scores preflight risk. Native OpenClaw integration via "
+        "/v1/openclaw/recover."
     ),
     lifespan=lifespan,
     docs_url="/docs",
@@ -106,13 +127,28 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# OPENCLAW 1 — CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["X-API-Key", "Content-Type", "X-Trace-Id"],
+)
 
-API_KEY_HEADER      = APIKeyHeader(name="X-API-Key", auto_error=False)
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 _KEY_CACHE: Dict[str, Dict[str, Any]] = {}
 _KEY_CACHE_TTL_SECONDS = 60
 
 
 async def _lookup_api_key(api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    DB-backed API key lookup with 60s in-memory cache.
+    Replace static_keys stub with asyncpg Supabase query:
+        row = await db.fetchrow(
+            "SELECT tenant_id, tier FROM active_api_keys WHERE key_hash = $1",
+            hashlib.sha256(api_key.encode()).hexdigest()
+        )
+    """
     now    = time.time()
     cached = _KEY_CACHE.get(api_key)
     if cached and (now - cached["cached_at"]) < _KEY_CACHE_TTL_SECONDS:
@@ -127,7 +163,8 @@ async def _lookup_api_key(api_key: str) -> Optional[Dict[str, Any]]:
     entry = {**tenant_data, "cached_at": now}
     _KEY_CACHE[api_key] = entry
 
-    expired = [k for k, v in _KEY_CACHE.items() if now - v["cached_at"] > _KEY_CACHE_TTL_SECONDS * 2]
+    expired = [k for k, v in _KEY_CACHE.items()
+               if now - v["cached_at"] > _KEY_CACHE_TTL_SECONDS * 2]
     for k in expired:
         _KEY_CACHE.pop(k, None)
 
@@ -186,6 +223,64 @@ class RecoveryActionType(str, Enum):
 
 SCHEMA_CACHE_TTL = 86_400
 
+
+def _build_openclaw_instruction(
+    action_type:      RecoveryActionType,
+    recovery_prompt:  Optional[str],
+    corrected_payload: Optional[Dict[str, Any]],
+    retry_after_ms:   Optional[int],
+    tool_name:        str,
+) -> str:
+    """
+    OPENCLAW 5 — Builds a direct plaintext instruction for OpenClaw agents.
+
+    LLMs are notoriously bad at mapping ENUM strings like RELAX_SCHEMA
+    to physical actions. This field removes the cognitive load entirely —
+    the agent reads one sentence and knows exactly what to do next.
+    No interpretation required. No hallucinated recovery paths.
+    """
+    if action_type == RecoveryActionType.RETRY_WITH_BACKOFF:
+        ms = retry_after_ms or 2000
+        return f"Wait {ms}ms then retry the same tool call to '{tool_name}'."
+
+    elif action_type == RecoveryActionType.RELAX_SCHEMA:
+        if corrected_payload:
+            return (
+                f"Retry '{tool_name}' with this corrected payload: "
+                f"{json.dumps(corrected_payload)}"
+            )
+        return f"Schema mismatch on '{tool_name}'. Review the tool schema before retrying."
+
+    elif action_type == RecoveryActionType.INJECT_KNOWLEDGE:
+        return recovery_prompt or f"Inject correction context before retrying '{tool_name}'."
+
+    elif action_type == RecoveryActionType.HUMAN_HANDOFF:
+        return (
+            f"STOP EXECUTION. Do not retry '{tool_name}'. "
+            f"Alert Steven via Telegram immediately. "
+            f"Reason: {recovery_prompt or 'escalated by AgentRx'}"
+        )
+
+    elif action_type == RecoveryActionType.REFRESH_AUTH:
+        return (
+            f"Your credentials for '{tool_name}' have expired or are invalid. "
+            f"Request a fresh token before retrying. Do not retry with current credentials."
+        )
+
+    elif action_type == RecoveryActionType.SKIP_AND_CONTINUE:
+        return (
+            f"Tool '{tool_name}' is deprecated or unavailable. "
+            f"Skip this step and continue with your next planned action."
+        )
+
+    elif action_type == RecoveryActionType.ABORT:
+        return (
+            f"This failure on '{tool_name}' is unrecoverable. "
+            f"Stop the current task entirely."
+        )
+
+    return recovery_prompt or "Review the failure and retry if appropriate."
+
 class AgentState(BaseModel):
     agent_id:          str                  = Field(..., min_length=1, max_length=128)
     goal:              str                  = Field(..., min_length=1, max_length=2048)
@@ -203,19 +298,38 @@ class AgentState(BaseModel):
 
 
 class FailedToolCall(BaseModel):
-    mcp_tool_name:     str              = Field(..., min_length=1, max_length=256)
-    attempted_payload: Dict[str, Any]   = Field(default_factory=dict)
-    error_response:    Dict[str, Any]   = Field(default_factory=dict)
-    latency_ms:        int              = Field(..., ge=0)
+    mcp_tool_name:     str            = Field(..., min_length=1, max_length=256)
+    attempted_payload: Dict[str, Any] = Field(default_factory=dict)
+    error_response:    Dict[str, Any] = Field(default_factory=dict)
+    # OPENCLAW 2: default=0 so shell scripts don't need timing data.
+    latency_ms:        int            = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def flag_latency_outlier(self) -> "FailedToolCall":
         if self.latency_ms > 30_000:
             logger.warning(
-                f"Extreme latency reported: {self.latency_ms}ms for "
-                f"tool '{self.mcp_tool_name}'."
+                f"Extreme latency reported: {self.latency_ms}ms "
+                f"for '{self.mcp_tool_name}'."
             )
         return self
+
+
+class RecoveryRequest(BaseModel):
+    state:       AgentState
+    failure:     FailedToolCall
+    tool_schema: Optional[Dict[str, Any]] = None
+    schema_hash: Optional[str]            = Field(None, min_length=64, max_length=64)
+
+
+# OPENCLAW 4 — Flat simplified model for OpenClaw shell script callers.
+class OpenClawRecoveryRequest(BaseModel):
+    agent_id:          str            = Field(..., min_length=1, max_length=128)
+    tool_name:         str            = Field(..., min_length=1, max_length=256)
+    error_message:     str            = Field(default="", max_length=1000)
+    error_code:        int            = Field(default=0)
+    attempted_payload: Dict[str, Any] = Field(default_factory=dict)
+    goal:              str            = Field(default="Complete current task", max_length=2048)
+
 
 SCHEMA_MAX_BYTES = 65_536
 SCHEMA_MAX_DEPTH = 10
@@ -236,6 +350,7 @@ def _measure_depth(obj: Any, current: int = 0) -> int:
 
 
 class SchemaRegisterRequest(BaseModel):
+    """FIX 13: Validates byte size (<=64KB) and depth (<=10) before Redis write."""
     tool_schema: Dict[str, Any]
 
     @model_validator(mode="after")
@@ -245,8 +360,7 @@ class SchemaRegisterRequest(BaseModel):
         if byte_size > SCHEMA_MAX_BYTES:
             raise ValueError(
                 f"Schema size {byte_size:,} bytes exceeds maximum of "
-                f"{SCHEMA_MAX_BYTES:,} bytes. Split large schemas or remove "
-                f"unnecessary properties."
+                f"{SCHEMA_MAX_BYTES:,} bytes. Split large schemas."
             )
         depth = _measure_depth(self.tool_schema)
         if depth > SCHEMA_MAX_DEPTH:
@@ -257,39 +371,36 @@ class SchemaRegisterRequest(BaseModel):
         return self
 
 
-class RecoveryRequest(BaseModel):
-    state:       AgentState
-    failure:     FailedToolCall
-    tool_schema: Optional[Dict[str, Any]] = None
-    schema_hash: Optional[str]            = Field(None, min_length=64, max_length=64)
-
-
 class SchemaRegisterResponse(BaseModel):
     schema_hash: str
     cached:      bool
     ttl_seconds: int = SCHEMA_CACHE_TTL
 
 
+# OPENCLAW 5 — openclaw_instruction added to RecoveryAction.
+# Direct plaintext command for OpenClaw agents — removes cognitive load
+# of mapping ENUM strings to physical actions. Priority requirement.
 class RecoveryAction(BaseModel):
-    action_type:       RecoveryActionType
-    failure_signature: FailureSignature
-    corrected_payload: Optional[Dict[str, Any]] = None
-    recovery_prompt:   Optional[str]            = None
-    confidence_score:  float                    = Field(..., ge=0.0, le=1.0)
-    retry_after_ms:    Optional[int]            = None
-    trace_id:          str                      = Field(default_factory=lambda: str(uuid.uuid4()))
+    action_type:           RecoveryActionType
+    failure_signature:     FailureSignature
+    corrected_payload:     Optional[Dict[str, Any]] = None
+    recovery_prompt:       Optional[str]            = None
+    confidence_score:      float                    = Field(..., ge=0.0, le=1.0)
+    retry_after_ms:        Optional[int]            = None
+    openclaw_instruction:  Optional[str]            = None
+    trace_id:              str                      = Field(default_factory=lambda: str(uuid.uuid4()))
 
 
 class PreflightRequest(BaseModel):
-    agent_id:        str              = Field(..., min_length=1, max_length=128)
-    mcp_tool_name:   str
+    agent_id:         str            = Field(..., min_length=1, max_length=128)
+    mcp_tool_name:    str
     intended_payload: Dict[str, Any]
-    tool_schema:     Optional[Dict[str, Any]] = None
-    schema_hash:     Optional[str]            = Field(None, min_length=64, max_length=64)
+    tool_schema:      Optional[Dict[str, Any]] = None
+    schema_hash:      Optional[str]            = Field(None, min_length=64, max_length=64)
 
 
 class PreflightResult(BaseModel):
-    risk_score:           float                    = Field(..., ge=0.0, le=1.0)
+    risk_score:           float                      = Field(..., ge=0.0, le=1.0)
     predicted_signature:  Optional[FailureSignature] = None
     suggested_correction: Optional[Dict[str, Any]]   = None
     proceed:              bool
@@ -297,6 +408,7 @@ class PreflightResult(BaseModel):
     trace_id:             str                        = Field(default_factory=lambda: str(uuid.uuid4()))
 
 class RedisUnavailableError(Exception):
+    """FAIL-CLOSED: raised on Redis errors to prevent bypassing loop circuit breaker."""
     pass
 
 
@@ -317,7 +429,11 @@ async def get_failure_history(tenant_id: str, agent_id: str) -> List[str]:
         raise RedisUnavailableError(str(e))
 
 
-async def record_failure(tenant_id: str, agent_id: str, signature: FailureSignature) -> None:
+async def record_failure(
+    tenant_id: str,
+    agent_id:  str,
+    signature: FailureSignature,
+) -> None:
     try:
         key  = _failure_key(tenant_id, agent_id)
         pipe = redis_client.pipeline()
@@ -329,7 +445,12 @@ async def record_failure(tenant_id: str, agent_id: str, signature: FailureSignat
         logger.error(f"Redis write failed for tenant={tenant_id} agent={agent_id}: {e}")
 
 
-async def atomic_increment_and_get(tenant_id: str, agent_id: str, tool_name: str) -> int:
+async def atomic_increment_and_get(
+    tenant_id: str,
+    agent_id:  str,
+    tool_name: str,
+) -> int:
+    """FIX 4: Atomic INCR eliminates TOCTOU race in loop detection."""
     try:
         key   = _same_call_key(tenant_id, agent_id, tool_name)
         count = await redis_client.incr(key)
@@ -340,22 +461,35 @@ async def atomic_increment_and_get(tenant_id: str, agent_id: str, tool_name: str
         raise RedisUnavailableError(str(e))
 
 
-WEBHOOK_STREAM = "agentrx:webhook_stream"
+_INJECTION_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_NEWLINE_PATTERN   = re.compile(r"[\r\n]+")
+_MAX_EXTERNAL_STRING_LEN = 200
+
+
+def sanitize_external_string(raw: str) -> str:
+    """FIX 6: Strips control chars, wraps in [EXTERNAL ERROR: "..."] delimiter."""
+    if not isinstance(raw, str):
+        raw = str(raw)
+    cleaned = _INJECTION_PATTERN.sub("", raw)
+    cleaned = _NEWLINE_PATTERN.sub(" ", cleaned)
+    cleaned = cleaned[:_MAX_EXTERNAL_STRING_LEN]
+    return f'[EXTERNAL ERROR: "{cleaned}"]'
 
 
 async def enqueue_alert_to_stream(
-    tenant_id:        str,
-    agent_id:         str,
-    action_type:      "RecoveryActionType",
+    tenant_id:         str,
+    agent_id:          str,
+    action_type:       "RecoveryActionType",
     failure_signature: "FailureSignature",
-    recovery_prompt:  Optional[str],
-    trace_id:         str,
+    recovery_prompt:   Optional[str],
+    trace_id:          str,
 ) -> None:
+    """FIX 7: XADD to Redis Stream — microseconds. Worker handles HTTP delivery."""
     if not settings.webhook_url:
         return
     try:
         await redis_client.xadd(
-            WEBHOOK_STREAM,
+            "agentrx:webhook_stream",
             {
                 "event":             "agentrx.alert",
                 "action_type":       action_type.value,
@@ -373,26 +507,14 @@ async def enqueue_alert_to_stream(
     except Exception as e:
         logger.error(f"Failed to enqueue alert: {e}", extra={"trace_id": trace_id})
 
-_INJECTION_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_NEWLINE_PATTERN   = re.compile(r"[\r\n]+")
-_MAX_EXTERNAL_STRING_LEN = 200
 
-
-def sanitize_external_string(raw: str) -> str:
-    if not isinstance(raw, str):
-        raw     = str(raw)
-    cleaned = _INJECTION_PATTERN.sub("", raw)
-    cleaned = _NEWLINE_PATTERN.sub(" ", cleaned)
-    cleaned = cleaned[:_MAX_EXTERNAL_STRING_LEN]
-    return f'[EXTERNAL ERROR: "{cleaned}"]'
-
-
-SCHEMA_CACHE_KEY_PREFIX = "agentrx:schema:"
+def _schema_cache_key(schema_hash: str) -> str:
+    return f"agentrx:schema:{schema_hash}"
 
 
 async def get_cached_schema(schema_hash: str) -> Optional[Dict[str, Any]]:
     try:
-        raw = await redis_client.get(f"{SCHEMA_CACHE_KEY_PREFIX}{schema_hash}")
+        raw = await redis_client.get(_schema_cache_key(schema_hash))
         return json.loads(raw) if raw else None
     except Exception as e:
         logger.error(f"Schema cache read failed: {e}")
@@ -404,7 +526,7 @@ async def store_schema(schema: Dict[str, Any]) -> str:
     schema_hash = hashlib.sha256(serialized.encode()).hexdigest()
     try:
         await redis_client.set(
-            f"{SCHEMA_CACHE_KEY_PREFIX}{schema_hash}",
+            _schema_cache_key(schema_hash),
             serialized,
             ex=SCHEMA_CACHE_TTL,
         )
@@ -412,9 +534,8 @@ async def store_schema(schema: Dict[str, Any]) -> str:
         logger.error(f"Schema cache write failed: {e}")
     return schema_hash
 
-
 def classify_failure(
-    failure:         "FailedToolCall",
+    failure:         FailedToolCall,
     past_signatures: List[str],
     same_call_count: int,
     tool_schema:     Optional[Dict[str, Any]] = None,
@@ -431,27 +552,40 @@ def classify_failure(
     if same_call_count >= 3:
         return FailureSignature.AGENT_LOOP
 
-    if code in (401, 403) or any(kw in msg for kw in ("unauthorized", "forbidden", "auth", "token expired", "permission denied")):
+    if code in (401, 403) or any(kw in msg for kw in (
+        "unauthorized", "forbidden", "auth", "token expired", "permission denied"
+    )):
         return FailureSignature.AUTH_FAILURE
 
     tool_lower = failure.mcp_tool_name.lower()
-    if any(kw in msg for kw in ("deprecated", "no longer available", "removed", "end of life", "sunset")):
+    if any(kw in msg for kw in (
+        "deprecated", "no longer available", "removed", "end of life", "sunset"
+    )):
         return FailureSignature.TOOL_DEPRECATED
     if code == 404 and tool_lower in msg:
         return FailureSignature.TOOL_DEPRECATED
 
-    if code == 429 or any(kw in msg for kw in ("rate limit", "too many requests", "quota exceeded", "throttl")):
+    if code == 429 or any(kw in msg for kw in (
+        "rate limit", "too many requests", "quota exceeded", "throttl"
+    )):
         return FailureSignature.RATE_LIMIT_EXCEEDED
 
-    if any(kw in msg for kw in ("timeout", "timed out", "connection refused", "network", "unreachable", "gateway")):
+    if any(kw in msg for kw in (
+        "timeout", "timed out", "connection refused", "network", "unreachable", "gateway"
+    )):
         return FailureSignature.NETWORK_LATENCY
     if failure.latency_ms > 10_000 and code == 0:
         return FailureSignature.NETWORK_LATENCY
 
-    if code == 404 or any(kw in msg for kw in ("not found", "does not exist", "no such", "missing resource")):
+    if code == 404 or any(kw in msg for kw in (
+        "not found", "does not exist", "no such", "missing resource"
+    )):
         return FailureSignature.RESOURCE_MISSING
 
-    if any(kw in msg for kw in ("validation error", "invalid type", "schema", "expected", "must be", "required field", "bad request")) or code == 422:
+    if any(kw in msg for kw in (
+        "validation error", "invalid type", "schema", "expected",
+        "must be", "required field", "bad request"
+    )) or code == 422:
         if tool_schema:
             schema_props = set((tool_schema.get("properties") or {}).keys())
             payload_keys = set(failure.attempted_payload.keys())
@@ -465,6 +599,7 @@ def classify_failure(
         return FailureSignature.HALLUCINATED_PARAM
 
     return FailureSignature.UNKNOWN
+
 
 def fix_payload(
     payload:     Dict[str, Any],
@@ -483,14 +618,11 @@ def fix_payload(
         if schema_props and key not in schema_props:
             logger.info(f"Dropping hallucinated key '{key}' not in tool schema.")
             continue
-        expected_type = None
-        if key in schema_props:
-            expected_type = schema_props[key].get("type")
+        expected_type = schema_props[key].get("type") if key in schema_props else None
         corrected[key] = _coerce_value(value, expected_type)
 
     if tool_schema:
-        required = tool_schema.get("required", [])
-        for req_key in required:
+        for req_key in tool_schema.get("required", []):
             if req_key not in corrected:
                 logger.warning(f"Required field '{req_key}' missing after correction.")
 
@@ -523,8 +655,9 @@ def _coerce_value(value: Any, expected_type: Optional[str]) -> Any:
             return [v.strip() for v in value.split(",")]
         if not isinstance(value, list):
             return [value]
-    # No type hint — return original value untouched.
-    # Never coerce without explicit schema demand.
+    elif expected_type == "object":
+        if isinstance(value, dict):
+            return value
     return value
 
 def score_preflight_risk(request: PreflightRequest) -> PreflightResult:
@@ -533,8 +666,8 @@ def score_preflight_risk(request: PreflightRequest) -> PreflightResult:
     predicted:  Optional[FailureSignature] = None
     suggestion: Optional[Dict[str, Any]]   = None
 
-    schema_props = request.tool_schema.get("properties", {}) if request.tool_schema else {}
-    required     = request.tool_schema.get("required", []) if request.tool_schema else []
+    schema_props = request.tool_schema.get("properties", {})
+    required     = request.tool_schema.get("required", [])
 
     unknown_keys = set(request.intended_payload.keys()) - set(schema_props.keys())
     if unknown_keys:
@@ -557,7 +690,7 @@ def score_preflight_risk(request: PreflightRequest) -> PreflightResult:
             continue
         expected_type = schema_props[key].get("type")
         if expected_type == "integer" and not isinstance(value, int):
-            risk += 0.10
+            risk     += 0.10
             predicted = predicted or FailureSignature.SCHEMA_MISMATCH
             warnings.append(f"Field '{key}' should be integer, got {type(value).__name__}")
         elif expected_type == "boolean" and not isinstance(value, bool):
@@ -584,17 +717,28 @@ def score_preflight_risk(request: PreflightRequest) -> PreflightResult:
     )
 
 async def build_recovery_action(
-    request:         "RecoveryRequest",
+    request:         RecoveryRequest,
     signature:       FailureSignature,
     past_signatures: List[str],
     trace_id:        str,
 ) -> RecoveryAction:
-    history_len     = len(request.state.execution_history)
-    loop_threshold  = settings.loop_detection_threshold
-    same_sig_count  = past_signatures.count(signature.value)
+    history_len    = len(request.state.execution_history)
+    loop_threshold = settings.loop_detection_threshold
+
+    def _make_action(**kwargs) -> RecoveryAction:
+        """Helper that auto-populates openclaw_instruction from the other fields."""
+        action = RecoveryAction(**kwargs, trace_id=trace_id)
+        action.openclaw_instruction = _build_openclaw_instruction(
+            action_type       = action.action_type,
+            recovery_prompt   = action.recovery_prompt,
+            corrected_payload = action.corrected_payload,
+            retry_after_ms    = action.retry_after_ms,
+            tool_name         = request.failure.mcp_tool_name,
+        )
+        return action
 
     if history_len > loop_threshold:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.HUMAN_HANDOFF,
             failure_signature = FailureSignature.AGENT_LOOP,
             recovery_prompt   = (
@@ -603,11 +747,11 @@ async def build_recovery_action(
                 f"Pausing for human review. Do not retry."
             ),
             confidence_score  = 1.0,
-            trace_id          = trace_id,
         )
 
+    same_sig_count = past_signatures.count(signature.value)
     if same_sig_count >= 2:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.HUMAN_HANDOFF,
             failure_signature = signature,
             recovery_prompt   = (
@@ -616,13 +760,12 @@ async def build_recovery_action(
                 f"Automatic recovery exhausted. Escalating to human."
             ),
             confidence_score  = 1.0,
-            trace_id          = trace_id,
         )
 
     if signature == FailureSignature.SCHEMA_MISMATCH:
         corrected = fix_payload(request.failure.attempted_payload, request.tool_schema)
         changed   = corrected != request.failure.attempted_payload
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.RELAX_SCHEMA,
             failure_signature = signature,
             corrected_payload = corrected,
@@ -632,12 +775,11 @@ async def build_recovery_action(
                 f"no automatic correction was possible. Review the tool schema."
             ),
             confidence_score  = 0.90 if changed else 0.45,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.HALLUCINATED_PARAM:
         corrected = fix_payload(request.failure.attempted_payload, request.tool_schema)
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.INJECT_KNOWLEDGE,
             failure_signature = signature,
             corrected_payload = corrected,
@@ -648,37 +790,36 @@ async def build_recovery_action(
                 f"Do not invent parameter names."
             ),
             confidence_score  = 0.85,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.HALLUCINATED_VALUE:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.INJECT_KNOWLEDGE,
             failure_signature = signature,
-            corrected_payload = fix_payload(request.failure.attempted_payload, request.tool_schema),
+            corrected_payload = fix_payload(
+                request.failure.attempted_payload, request.tool_schema
+            ),
             recovery_prompt   = (
                 f"SYSTEM CORRECTION: Parameters for '{request.failure.mcp_tool_name}' "
                 f"exist in schema but values were invalid. "
                 f"Check enum constraints, string formats, and value ranges."
             ),
             confidence_score  = 0.78,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.RATE_LIMIT_EXCEEDED:
         backoff_ms = min(2000 * (2 ** min(same_sig_count, 4)), 60_000)
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.RETRY_WITH_BACKOFF,
             failure_signature = signature,
             recovery_prompt   = f"Rate limit hit. Retry after {backoff_ms}ms.",
             confidence_score  = 0.95,
             retry_after_ms    = backoff_ms,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.NETWORK_LATENCY:
         backoff_ms = 3000 * (same_sig_count + 1)
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.RETRY_WITH_BACKOFF,
             failure_signature = signature,
             recovery_prompt   = (
@@ -688,11 +829,10 @@ async def build_recovery_action(
             ),
             confidence_score  = 0.88,
             retry_after_ms    = backoff_ms,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.RESOURCE_MISSING:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.INJECT_KNOWLEDGE,
             failure_signature = signature,
             recovery_prompt   = (
@@ -701,11 +841,10 @@ async def build_recovery_action(
                 f"before retrying. Do not guess IDs."
             ),
             confidence_score  = 0.75,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.AUTH_FAILURE:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.REFRESH_AUTH,
             failure_signature = signature,
             recovery_prompt   = (
@@ -714,11 +853,10 @@ async def build_recovery_action(
                 f"Do not retry with the same credentials."
             ),
             confidence_score  = 0.92,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.TOOL_DEPRECATED:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.SKIP_AND_CONTINUE,
             failure_signature = signature,
             recovery_prompt   = (
@@ -727,11 +865,10 @@ async def build_recovery_action(
                 f"tool registry and update your plan accordingly."
             ),
             confidence_score  = 0.80,
-            trace_id          = trace_id,
         )
 
     elif signature == FailureSignature.AGENT_LOOP:
-        return RecoveryAction(
+        return _make_action(
             action_type       = RecoveryActionType.HUMAN_HANDOFF,
             failure_signature = signature,
             recovery_prompt   = (
@@ -739,74 +876,66 @@ async def build_recovery_action(
                 f"repeatedly with identical parameters. Execution halted."
             ),
             confidence_score  = 1.0,
-            trace_id          = trace_id,
         )
 
     safe_error = sanitize_external_string(
         request.failure.error_response.get("message", "no message")
     )
-    return RecoveryAction(
+    return _make_action(
         action_type       = RecoveryActionType.HUMAN_HANDOFF,
         failure_signature = FailureSignature.UNKNOWN,
         recovery_prompt   = (
             f"Unclassified failure on '{request.failure.mcp_tool_name}'. "
-            f"Error: {safe_error}. "
-            f"Escalating to human review."
+            f"Error: {safe_error}. Escalating to human review."
         ),
         confidence_score  = 0.50,
-        trace_id          = trace_id,
     )
-
 
 @app.exception_handler(RedisUnavailableError)
 async def redis_unavailable_handler(request: Request, exc: RedisUnavailableError):
-    trace_id = str(uuid.uuid4())
+    trace_id = getattr(exc, "trace_id", str(uuid.uuid4()))
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content=RecoveryAction(
-            action_type       = RecoveryActionType.HUMAN_HANDOFF,
-            failure_signature = FailureSignature.UNKNOWN,
-            recovery_prompt   = (
+            action_type          = RecoveryActionType.HUMAN_HANDOFF,
+            failure_signature    = FailureSignature.UNKNOWN,
+            recovery_prompt      = (
                 "AgentRx state store is temporarily unavailable. "
                 "Loop history cannot be verified. Defaulting to HUMAN_HANDOFF "
                 "as a safety measure. Retry once the service recovers."
             ),
-            confidence_score  = 1.0,
-            trace_id          = trace_id,
+            openclaw_instruction = (
+                "STOP EXECUTION. AgentRx Redis is unavailable. "
+                "Alert Steven via Telegram immediately. Do not retry any tool calls."
+            ),
+            confidence_score     = 1.0,
+            trace_id             = trace_id,
         ).model_dump(),
     )
 
-@app.get("/health", tags=["Ops"])
-async def health():
-    return {"status": "ok"}
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    trace_id = str(uuid.uuid4())
+    logger.exception(f"Unhandled exception: {exc}", extra={"trace_id": trace_id})
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail":   "Internal server error. Please retry or contact support.",
+            "trace_id": trace_id,
+        },
+    )
 
 
-@app.get("/ready", tags=["Ops"])
-async def readiness():
-    try:
-        await redis_client.ping()
-        return {"status": "ready", "redis": "ok"}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Redis not reachable: {e}",
-        )
-
-
-@app.post(
-    "/v1/diagnose_and_recover",
-    response_model=RecoveryAction,
-    responses={503: {"model": RecoveryAction, "description": "Redis unavailable"}},
-    tags=["Recovery"],
-    summary="Diagnose a failed agent tool call and return a recovery action.",
-)
-@limiter.limit(settings.rate_limit)
-async def diagnose_and_recover(
-    request: Request,
-    body:    RecoveryRequest,
-    tenant:  Dict[str, Any] = Depends(require_api_key),
+async def _diagnose_internal(
+    body:     RecoveryRequest,
+    tenant:   Dict[str, Any],
+    trace_id: str,
 ) -> RecoveryAction:
-    trace_id  = request.headers.get("x-trace-id") or str(uuid.uuid4())
+    """
+    OPENCLAW 3 — Core logic extracted from route handler.
+    Shared by /v1/diagnose_and_recover and /v1/openclaw/recover.
+    """
     agent_id  = body.state.agent_id
     tenant_id = tenant["tenant_id"]
 
@@ -858,10 +987,15 @@ async def diagnose_and_recover(
     )
 
     if action.confidence_score < settings.min_auto_confidence:
-        action.action_type    = RecoveryActionType.HUMAN_HANDOFF
-        action.recovery_prompt = (
+        action.action_type       = RecoveryActionType.HUMAN_HANDOFF
+        action.recovery_prompt   = (
             (action.recovery_prompt or "") +
             " [Low confidence — escalated to human review.]"
+        )
+        action.openclaw_instruction = (
+            f"STOP EXECUTION. Low confidence recovery on "
+            f"'{body.failure.mcp_tool_name}'. "
+            f"Alert Steven via Telegram immediately."
         )
 
     if action.action_type == RecoveryActionType.HUMAN_HANDOFF:
@@ -876,6 +1010,99 @@ async def diagnose_and_recover(
 
     return action
 
+@app.get("/health", tags=["Ops"])
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready", tags=["Ops"])
+async def readiness():
+    try:
+        await redis_client.ping()
+        return {"status": "ready", "redis": "ok"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Redis not reachable: {e}",
+        )
+
+
+@app.post(
+    "/v1/diagnose_and_recover",
+    response_model=RecoveryAction,
+    responses={503: {"model": RecoveryAction, "description": "Redis unavailable"}},
+    tags=["Recovery"],
+    summary="Diagnose a failed agent tool call and return a recovery action.",
+)
+@limiter.limit(settings.rate_limit)
+async def diagnose_and_recover(
+    request: Request,
+    body:    RecoveryRequest,
+    tenant:  Dict[str, Any] = Depends(require_api_key),
+) -> RecoveryAction:
+    """
+    Primary recovery endpoint for LangChain, CrewAI, PydanticAI, AutoGen,
+    and the Python SDK. Accepts full nested RecoveryRequest payload.
+    For OpenClaw shell scripts use /v1/openclaw/recover instead.
+    """
+    trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
+    return await _diagnose_internal(body, tenant, trace_id)
+
+
+@app.post(
+    "/v1/openclaw/recover",
+    response_model=RecoveryAction,
+    responses={503: {"model": RecoveryAction, "description": "Redis unavailable"}},
+    tags=["OpenClaw"],
+    summary="Simplified recovery endpoint for OpenClaw agents and shell scripts.",
+)
+@limiter.limit(settings.rate_limit)
+async def openclaw_recover(
+    request: Request,
+    body:    OpenClawRecoveryRequest,
+    tenant:  Dict[str, Any] = Depends(require_api_key),
+) -> RecoveryAction:
+    """
+    OPENCLAW 4 — Flat-payload endpoint for OpenClaw agents using curl.
+
+    Accepts 4-6 flat fields. Internally builds a full RecoveryRequest
+    and calls _diagnose_internal(). Same logic, same Redis state tracking,
+    same circuit breaker. Response includes openclaw_instruction — a
+    direct plaintext command the agent executes without interpretation.
+
+    Minimum valid curl call:
+        curl -X POST .../v1/openclaw/recover
+          -H "X-API-Key: your_key"
+          -H "Content-Type: application/json"
+          -d '{
+            "agent_id": "lamar_cmo",
+            "tool_name": "web_search",
+            "error_message": "connection timeout",
+            "error_code": 0
+          }'
+    """
+    trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
+
+    recovery_request = RecoveryRequest(
+        state=AgentState(
+            agent_id          = body.agent_id,
+            goal              = body.goal,
+            active_plan       = [],
+            execution_history = [],
+        ),
+        failure=FailedToolCall(
+            mcp_tool_name     = body.tool_name,
+            attempted_payload = body.attempted_payload,
+            error_response    = {
+                "message":     body.error_message,
+                "status_code": body.error_code,
+            },
+            latency_ms = 0,
+        ),
+    )
+
+    return await _diagnose_internal(recovery_request, tenant, trace_id)
+
 @app.post(
     "/v1/preflight",
     response_model=PreflightResult,
@@ -888,6 +1115,11 @@ async def preflight_check(
     body:    PreflightRequest,
     tenant:  Dict[str, Any] = Depends(require_api_key),
 ) -> PreflightResult:
+    """
+    Proactive risk scoring. Call BEFORE executing a tool.
+    Pass tool_schema once, get back schema_hash, use hash on future calls.
+    Returns proceed=False if risk >= 0.50.
+    """
     trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
     logger.info(
         "Preflight check.",
@@ -939,6 +1171,11 @@ async def register_schema(
     body:    SchemaRegisterRequest,
     tenant:  Dict[str, Any] = Depends(require_api_key),
 ) -> SchemaRegisterResponse:
+    """
+    Upload a tool schema once. AgentRx stores it for 24 hours and returns
+    a SHA-256 hash. Pass this hash in subsequent preflight and recovery
+    calls instead of re-uploading the full schema every time.
+    """
     schema_hash = await store_schema(body.tool_schema)
     return SchemaRegisterResponse(schema_hash=schema_hash, cached=True)
 
@@ -949,8 +1186,14 @@ async def register_schema(
 )
 async def clear_agent_state(
     agent_id: str,
+    request:  Request,
     tenant:   Dict[str, Any] = Depends(require_api_key),
 ):
+    """
+    FIX 5 — Cross-Tenant Hijacking:
+    Keys are scoped to tenant namespace. Tenant A cannot delete
+    agent state belonging to tenant B even with a valid API key.
+    """
     tenant_id = tenant["tenant_id"]
     try:
         pattern = f"agentrx:*:{tenant_id}:{agent_id}*"
@@ -966,18 +1209,28 @@ async def clear_agent_state(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear state: {e}")
 
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    trace_id = str(uuid.uuid4())
-    logger.exception(
-        f"Unhandled exception: {exc}",
-        extra={"trace_id": trace_id},
-    )
-    return JSONResponse(
-        status_code=500,
-        content={
-            "detail":   "Internal server error. Please retry or contact support.",
-            "trace_id": trace_id,
+@app.get(
+    "/v1/openclaw/status",
+    tags=["OpenClaw"],
+    summary="Verify AgentRx is reachable and the OpenClaw integration is active.",
+)
+async def openclaw_status(
+    tenant: Dict[str, Any] = Depends(require_api_key),
+):
+    """
+    Health check specifically for OpenClaw skill verification.
+    Returns integration status and available endpoints.
+    Called by the SKILL.md on first install to confirm connectivity.
+    """
+    return {
+        "status":       "active",
+        "version":      "2.5.0",
+        "integration":  "openclaw",
+        "tenant_id":    tenant["tenant_id"],
+        "endpoints": {
+            "recover":   "/v1/openclaw/recover",
+            "preflight": "/v1/preflight",
+            "schema":    "/v1/schema/register",
+            "state":     "/v1/state/{agent_id}",
         },
-    )
+    }
