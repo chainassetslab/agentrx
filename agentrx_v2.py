@@ -59,6 +59,17 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def _get_ttl_for_tenant(tenant_id: str) -> int:
+    """
+    Beta tenants get a shorter TTL to flush garbage data quickly.
+    Free beta key maps to tenant_id starting with 'tenant_beta'.
+    Paid tenants get the full configured TTL.
+    """
+    if tenant_id.startswith("tenant_beta"):
+        return 600  # 10 minutes — auto-garbage-collect beta abuse
+    return settings.agent_state_ttl_seconds
+
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         log = {
@@ -101,10 +112,20 @@ async def lifespan(app: FastAPI):
     logger.info("Redis connection pool closed.")
 
 def rate_limit_key_func(request: Request) -> str:
-    """FIX 12: Rate limit by tenant_id not IP (serverless-safe)."""
+    """
+    FIX 12: Rate limit by tenant_id not IP (serverless-safe).
+    BETA FIX: Free beta tier keys by IP not tenant_id.
+    All beta users share one tenant_id — if we key by tenant,
+    one runaway script locks out every other beta user.
+    Keying by IP isolates each developer independently.
+    """
     tenant = getattr(request.state, "tenant", None)
-    if tenant and tenant.get("tenant_id"):
-        return f"tenant:{tenant['tenant_id']}"
+    if tenant:
+        if tenant.get("tier") == "free_beta":
+            ip = get_remote_address(request)
+            return f"beta_ip:{ip}"
+        if tenant.get("tenant_id"):
+            return f"tenant:{tenant['tenant_id']}"
     return get_remote_address(request)
 
 
@@ -158,7 +179,12 @@ async def _lookup_api_key(api_key: str) -> Optional[Dict[str, Any]]:
     if api_key not in static_keys:
         _KEY_CACHE.pop(api_key, None)
         return None
-    tenant_data = {"tenant_id": f"tenant_{api_key[:8]}", "tier": "dev"}
+    # Tag the public beta key with free_beta tier so rate limiter
+    # can isolate beta users by IP instead of shared tenant bucket.
+    if api_key.startswith("beta_"):
+        tenant_data = {"tenant_id": f"tenant_{api_key[:8]}", "tier": "free_beta"}
+    else:
+        tenant_data = {"tenant_id": f"tenant_{api_key[:8]}", "tier": "dev"}
 
     entry = {**tenant_data, "cached_at": now}
     _KEY_CACHE[api_key] = entry
@@ -439,7 +465,7 @@ async def record_failure(
         pipe = redis_client.pipeline()
         pipe.rpush(key, signature.value)
         pipe.ltrim(key, -50, -1)
-        pipe.expire(key, settings.agent_state_ttl_seconds)
+        pipe.expire(key, _get_ttl_for_tenant(tenant_id))
         await pipe.execute()
     except Exception as e:
         logger.error(f"Redis write failed for tenant={tenant_id} agent={agent_id}: {e}")
@@ -454,7 +480,7 @@ async def atomic_increment_and_get(
     try:
         key   = _same_call_key(tenant_id, agent_id, tool_name)
         count = await redis_client.incr(key)
-        await redis_client.expire(key, settings.agent_state_ttl_seconds)
+        await redis_client.expire(key, _get_ttl_for_tenant(tenant_id))
         return count
     except Exception as e:
         logger.error(f"Redis INCR failed for tenant={tenant_id} agent={agent_id}: {e}")
