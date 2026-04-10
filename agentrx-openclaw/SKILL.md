@@ -44,8 +44,7 @@ AGENTRX_BASE_URL=https://agentrx-production.up.railway.app
 Verify the integration is active:
 
 ```bash
-curl -s -X GET "${AGENTRX_BASE_URL}/v1/openclaw/status" \
-  -H "X-API-Key: ${AGENTRX_API_KEY}" | jq '.'
+curl -s "${AGENTRX_BASE_URL}/ready"
 Recovery After A Tool Failure
 When a tool call fails, call AgentRx immediately using the recover script:
 bash ~/.openclaw/skills/agentrx/scripts/recover.sh \

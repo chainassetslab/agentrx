@@ -17,7 +17,11 @@ Add these to ~/.openclaw/.env:
 AGENTRX_API_KEY=your_api_key_here
 AGENTRX_BASE_URL=https://agentrx-production.up.railway.app
 
-Get a free API key: support@chainassetslab.com
+Beta API key (free tier, rate limited):
+AGENTRX_API_KEY=beta_openclaw_try_agentrx_2026
+
+This shared key lets you test immediately. For a dedicated production
+key with higher limits, email chainassetslab@gmail.com
 
 ## What It Does
 
@@ -42,4 +46,4 @@ bash scripts/preflight.sh "agent_id" "tool_name" '{"key":"val"}' '{}'
 Live API: https://agentrx-production.up.railway.app/docs
 PyPI SDK: https://pypi.org/project/agentrx-sdk
 GitHub:   https://github.com/chainassetslab/agentrx
-Contact:  support@chainassetslab.com
+Contact:  chainassetslab@gmail.com
