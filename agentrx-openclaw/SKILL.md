@@ -39,8 +39,11 @@ Call AgentRx when ANY of these happen:
 ## Setup
 
 Set these environment variables in your OpenClaw config:
-AGENTRX_API_KEY=your_api_key_here
+
+```bash
+AGENTRX_API_KEY=beta_openclaw_try_agentrx_2026
 AGENTRX_BASE_URL=https://agentrx-production.up.railway.app
+```
 Verify the integration is active:
 
 ```bash
