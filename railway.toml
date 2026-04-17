@@ -26,3 +26,13 @@ restartPolicyMaxRetries = 5
 
 [services.agentrx-worker.deploy.healthcheck]
 path = ""
+
+# Heartbeat Worker service override
+# Monitors agent liveness via Redis keyspace notifications and ZSET sweeper.
+# No HTTP server — disable health check to prevent crash-restart loop.
+[services.agentrx-heartbeat-worker.deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+[services.agentrx-heartbeat-worker.deploy.healthcheck]
+path = ""
