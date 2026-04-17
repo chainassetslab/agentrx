@@ -433,6 +433,18 @@ class PreflightResult(BaseModel):
     warnings:             List[str]                  = Field(default_factory=list)
     trace_id:             str                        = Field(default_factory=lambda: str(uuid.uuid4()))
 
+
+class HeartbeatRequest(BaseModel):
+    agent_id:         str = Field(..., min_length=1, max_length=128, pattern=r"^[^:]+$")
+    status:           str = Field(default="active", max_length=50)
+    turn_count:       int = Field(default=0, ge=0)
+    last_tool:        str = Field(default="unknown", max_length=128)
+    interval_seconds: int = Field(default=60, ge=10, le=600)
+
+
+class HeartbeatStopRequest(BaseModel):
+    agent_id: str = Field(..., min_length=1, max_length=128, pattern=r"^[^:]+$")
+
 class RedisUnavailableError(Exception):
     """FAIL-CLOSED: raised on Redis errors to prevent bypassing loop circuit breaker."""
     pass
@@ -1204,6 +1216,57 @@ async def register_schema(
     """
     schema_hash = await store_schema(body.tool_schema)
     return SchemaRegisterResponse(schema_hash=schema_hash, cached=True)
+
+@app.post("/v1/heartbeat", tags=["Heartbeat"],
+    summary="Ping to keep agent marked as active. Triggers alert if missed.")
+@limiter.limit(settings.rate_limit)
+async def heartbeat(
+    request: Request,
+    body: HeartbeatRequest,
+    tenant: Dict[str, Any] = Depends(require_api_key),
+):
+    ttl = body.interval_seconds * 3
+    tenant_id = tenant["tenant_id"]
+    key = f"agentrx:heartbeat:{tenant_id}:{body.agent_id}"
+    expected_expiration = int(time.time()) + ttl
+    zset_member = f"{tenant_id}:{body.agent_id}"
+
+    heartbeat_data = {
+        "agent_id": body.agent_id,
+        "status": body.status,
+        "turn_count": body.turn_count,
+        "last_tool": body.last_tool,
+        "interval_seconds": body.interval_seconds,
+        "updated_at": int(time.time()),
+    }
+
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.set(key, json.dumps(heartbeat_data), ex=ttl)
+    pipe.zadd("agentrx:expected_expirations", {zset_member: expected_expiration})
+    await pipe.execute()
+
+    return {"status": "tracked", "ttl_seconds": ttl, "state": "active"}
+
+
+@app.post("/v1/heartbeat/stop", tags=["Heartbeat"],
+    summary="Gracefully stop heartbeat tracking to prevent false death alerts.")
+@limiter.limit(settings.rate_limit)
+async def heartbeat_stop(
+    request: Request,
+    body: HeartbeatStopRequest,
+    tenant: Dict[str, Any] = Depends(require_api_key),
+):
+    tenant_id = tenant["tenant_id"]
+    key = f"agentrx:heartbeat:{tenant_id}:{body.agent_id}"
+    zset_member = f"{tenant_id}:{body.agent_id}"
+
+    pipe = redis_client.pipeline(transaction=True)
+    pipe.delete(key)
+    pipe.zrem("agentrx:expected_expirations", zset_member)
+    await pipe.execute()
+
+    return {"status": "stopped"}
+
 
 @app.delete(
     "/v1/state/{agent_id}",
