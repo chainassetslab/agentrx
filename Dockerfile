@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agentrx_v2.py .
 COPY webhook_worker.py .
+COPY heartbeat_worker.py .
 
 # Document the port this container listens on.
 # Helps Railway auto-detect the ingress port.
